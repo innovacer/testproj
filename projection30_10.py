@@ -437,7 +437,7 @@ def main():
     # Sidebar for user inputs
     st.sidebar.header("Your Details")
     gender = st.sidebar.selectbox("Gender at Birth", ["Male", "Female"])
-    current_age = st.sidebar.number_input("Current Age", min_value=55, max_value=100, value=50)
+    current_age = st.sidebar.number_input("Current Age", min_value=55, max_value=100, value=55)
     salary = st.sidebar.number_input("Current Annual Salary (£)", min_value=0, value=40000)
     initial_fund = st.sidebar.number_input("Current Pension Fund Value (£)", min_value=0, value=50000)
     existing_tfc_withdrawals = st.sidebar.number_input("Existing Tax-Free Cash Withdrawals (£)", min_value=0.0, value=0.0)
