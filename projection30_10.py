@@ -132,15 +132,17 @@ def load_plsa_standards():
 # -----------------------------------------------------------------------------
 #                            Global Assumptions
 # -----------------------------------------------------------------------------
+# Tax and pension parameters for the 2026/27 tax year. Review each April.
 assumptions = {
     "inflation_rate": 0.02,  # Annual inflation rate
     "salary_indexation_rate": 0.035,  # Annual salary indexation rate
     "investment_growth_rate": 0.05,   # Annual investment growth rate
     "amc": 0.01,                     # Annual AMC (Annual Management Charge)
     "income_escalation_rate": 0.02,  # Annual income escalation rate
-    "state_pension_age": 65,         # Age when state pension starts
-    "state_pension_income_now": 10600.20,  # Current annual state pension
+    "state_pension_age": 67,         # SPA is rising from 66 to 67 (2026-2028); user-adjustable in the UI
+    "state_pension_income_now": 12547.60,  # Full new State Pension 2026/27 (£241.30/week)
     "tax_free_withdrawal_component": 0.25,  # 25% of the fund can be taken as tax-free lump sum
+    "lump_sum_allowance": 268275,    # Lifetime cap on tax-free cash (LSA)
     "annual_allowance_contributions": 60000,
     "money_purchase_annual_allowance": 10000,
     "annual_allowance_high_income_threshold": 200000,
@@ -154,14 +156,15 @@ assumptions = {
         (125140, 0.40),   # Higher Rate
         (np.inf, 0.45)    # Additional Rate
     ],
-    # Scottish Tax Bands
+    # Scottish Tax Bands 2026/27 (gross income thresholds)
     "tax_bands_scotland": [
         (12570, 0.0),    # Personal Allowance
-        (14667, 0.19),   # Starter Rate
-        (25296, 0.20),   # Basic Rate
+        (16537, 0.19),   # Starter Rate
+        (29526, 0.20),   # Basic Rate
         (43662, 0.21),   # Intermediate Rate
-        (150000, 0.41),  # Higher Rate
-        (np.inf, 0.46)   # Top Rate
+        (75000, 0.42),   # Higher Rate
+        (125140, 0.45),  # Advanced Rate
+        (np.inf, 0.48)   # Top Rate
     ]
 }
 
@@ -195,14 +198,12 @@ def calculate_taxes(income, tax_bands):
 
 def calculate_state_pension_income(current_age):
     """
-    Calculates the projected state pension income at the state's pension age,
-    adjusted for inflation from the current_age to the state pension age.
+    Returns the annual State Pension in today's money. The projection is in
+    real terms throughout (fund growth is net of inflation), so the State
+    Pension is held at its current value rather than inflated to a future
+    nominal amount.
     """
-    years_until_state_pension = assumptions['state_pension_age'] - current_age
-    if years_until_state_pension <= 0:
-        # Already reached or past state pension age
-        return assumptions['state_pension_income_now']
-    return assumptions['state_pension_income_now'] * ((1 + assumptions['inflation_rate']) ** years_until_state_pension)
+    return assumptions['state_pension_income_now']
 
 # -----------------------------------------------------------------------------
 #                       Core Projection Calculation
@@ -221,11 +222,20 @@ def project_pension(
     existing_tfc_withdrawals=0,
     max_age=90,
     tax_bands=None,
+    state_pension_age=None,
 ):
     """
     Projects pension fund growth (pre-retirement) and retirement income
     (post-retirement) based on user-selected strategy.
+
+    All figures are in today's money (real terms): fund growth is net of
+    inflation, and incomes/targets are held at their current value.
+    Tax-free cash is capped by the statutory Lump Sum Allowance across the
+    whole projection, including any tax-free cash already taken.
     """
+    if state_pension_age is None:
+        state_pension_age = assumptions['state_pension_age']
+
     years = np.arange(current_age, max_age + 1)
     uncrystallised_fund_values = []
     crystallised_fund_values = []
@@ -243,20 +253,47 @@ def project_pension(
     if strategy == "Decumulation Income (capital)" and (retirement_age - current_age) <= 1:
         retirement_age = current_age
 
-    # Pre-calc state pension at retirement (for indexing inflation).
-    state_pension_income_at_retirement = calculate_state_pension_income(current_age)
-    annual_retirement_income_adjusted = annual_retirement_income
+    state_pension_income = calculate_state_pension_income(current_age)
 
-    # Calculate max TFC available
-    max_tax_free_cash_available = uncrystallised_fund * assumptions['tax_free_withdrawal_component']
-    max_tax_free_cash_available -= existing_tfc_withdrawals
-    max_tax_free_cash_available = max(0, max_tax_free_cash_available)
+    # Lifetime cap on tax-free cash (Lump Sum Allowance), reduced by any
+    # tax-free cash the user has already taken from other schemes.
+    lsa_remaining = max(0, assumptions['lump_sum_allowance'] - existing_tfc_withdrawals)
+
+    def draw_tax_free(amount_needed):
+        """
+        Take a tax-free slice from the uncrystallised fund. Each £1 of
+        tax-free cash crystallises £3 alongside it (the 25% PCLS mechanic),
+        so the draw is capped at a quarter of the uncrystallised fund and by
+        the remaining Lump Sum Allowance. Returns the tax-free amount taken.
+        """
+        nonlocal uncrystallised_fund, crystallised_fund, lsa_remaining
+        tax_free = max(0, min(amount_needed, uncrystallised_fund / 4, lsa_remaining))
+        uncrystallised_fund -= tax_free * 4
+        crystallised_fund += tax_free * 3
+        lsa_remaining -= tax_free
+        return tax_free
 
     for age in years:
+        income = 0
         tax_free_cash = 0
-        # Grow uncrystallised fund pre-retirement by net growth
-        # (growth_rate - AMC - inflation to keep real terms).
-        uncrystallised_fund *= (1 + investment_growth_rate - assumptions['amc'] - inflation_rate)
+        shortfall = 0
+
+        # Grow both pots by net real growth (growth - AMC - inflation).
+        net_growth = 1 + investment_growth_rate - assumptions['amc'] - inflation_rate
+        uncrystallised_fund *= net_growth
+        crystallised_fund *= net_growth
+
+        # ------------- Immediate capital needs (decumulation only) ------------
+        if age == current_age and strategy != "Accumulation" and immediate_capital_goal > 0:
+            if strategy == "Decumulation – capital only":
+                # 100% taxable withdrawal, capped at the available fund
+                withdrawal = min(immediate_capital_goal, uncrystallised_fund)
+                uncrystallised_fund -= withdrawal
+                income += withdrawal
+            elif strategy == "Decumulation Income (capital)":
+                tax_free = draw_tax_free(immediate_capital_goal)
+                income += tax_free
+                tax_free_cash += tax_free
 
         # ------------------------ Before Retirement ---------------------------
         if age < retirement_age:
@@ -265,128 +302,76 @@ def project_pension(
                 uncrystallised_fund += annual_contribution
                 annual_contribution *= (1 + salary_growth_rate)
 
-            # No normal retirement income withdrawn
-            income = 0
-            tax = 0
-            net_income = 0
-            shortfall = 0
-
-            # Handle immediate capital needs for decumulation strategies
-            if age == current_age and strategy != "Accumulation":
-                if immediate_capital_goal > 0:
-                    if strategy == "Decumulation – capital only":
-                        # 100% taxable withdrawal allowed
-                        withdrawal = min(immediate_capital_goal, uncrystallised_fund)
-                        uncrystallised_fund -= withdrawal
-                        income = withdrawal
-                        tax = calculate_taxes(income, tax_bands)
-                        net_income = income - tax
-                    elif strategy == "Decumulation Income (capital)":
-                        # Use up to 100% TFC
-                        withdrawal = min(immediate_capital_goal, max_tax_free_cash_available)
-                        # Crystallising: 4x the TFC (1 part tax-free, 3 parts crystallised)
-                        uncrystallised_fund -= withdrawal * 4
-                        crystallised_fund += (withdrawal * 3)
-                        income = withdrawal  # tax-free
-                        net_income = income
-                        max_tax_free_cash_available -= withdrawal
-
-                    shortfall = 0
-
         # ------------------------- After Retirement ---------------------------
         else:
-            if age == retirement_age:
-                annual_retirement_income_adjusted = annual_retirement_income
-            else:
-                # Adjust with inflation annually
-                annual_retirement_income_adjusted *= (1 + inflation_rate)
-
-            # Handle TFC at retirement if strategy is "Accumulation"
-            if (age == retirement_age and strategy == "Accumulation"):
+            # Tax-free cash options at the point of retirement (Accumulation)
+            if age == retirement_age and strategy == "Accumulation":
                 if tax_free_cash_option == "Full tax-free cash":
-                    tax_free_cash = uncrystallised_fund * assumptions['tax_free_withdrawal_component']
-                    uncrystallised_fund -= tax_free_cash
+                    tax_free = min(
+                        uncrystallised_fund * assumptions['tax_free_withdrawal_component'],
+                        lsa_remaining,
+                    )
+                    uncrystallised_fund -= tax_free
+                    lsa_remaining -= tax_free
                     # The rest becomes crystallised
                     crystallised_fund += uncrystallised_fund
                     uncrystallised_fund = 0
+                    income += tax_free
+                    tax_free_cash += tax_free
 
                 elif tax_free_cash_option == "Partial tax-free cash":
-                    max_tfc = uncrystallised_fund * assumptions['tax_free_withdrawal_component']
-                    partial_tax_free_cash = min(partial_tax_free_cash, max_tfc)
-                    uncrystallised_fund -= partial_tax_free_cash
-                    crystallised_amount = partial_tax_free_cash * 3
-                    crystallised_fund += crystallised_amount
-                    uncrystallised_fund -= crystallised_amount
-                    tax_free_cash = partial_tax_free_cash
+                    tax_free = draw_tax_free(partial_tax_free_cash)
+                    income += tax_free
+                    tax_free_cash += tax_free
 
                 elif tax_free_cash_option == "UFPLS":
-                    ufpls_amount = min(ufpls_amount, uncrystallised_fund)
-                    uncrystallised_fund -= ufpls_amount
-                    tax_free_cash = ufpls_amount * 0.25
-                    taxable_cash = ufpls_amount * 0.75
-                    income = taxable_cash + tax_free_cash
-                    tax = calculate_taxes(income - tax_free_cash, tax_bands)
-                    net_income = income - tax
-                    shortfall = max(0, target_income - net_income)
+                    ufpls = min(ufpls_amount, uncrystallised_fund)
+                    uncrystallised_fund -= ufpls
+                    # 25% of a UFPLS is tax-free, subject to the LSA
+                    tax_free = min(ufpls * 0.25, lsa_remaining)
+                    lsa_remaining -= tax_free
+                    income += ufpls
+                    tax_free_cash += tax_free
 
-                # If "No tax-free cash," do nothing special
-                else:
-                    tax_free_cash = 0
+            # State pension (today's money)
+            if include_state_pension and age >= state_pension_age:
+                income += state_pension_income
 
-            # Now handle retirement income
-            # If we haven't done a UFPLS in the same year or if strategy != "Accumulation"
-            if (tax_free_cash_option != "UFPLS" or age > retirement_age) or (strategy != "Accumulation"):
-                income = 0
-                # State pension?
-                if include_state_pension and age >= assumptions['state_pension_age']:
-                    sp_income = state_pension_income_at_retirement * ((1 + inflation_rate) ** (age - assumptions['state_pension_age']))
-                    income += sp_income
-                else:
-                    sp_income = 0
+            # DB pension (today's money)
+            if include_db_pension and age >= db_pension_age:
+                income += db_pension_income
 
-                # DB pension?
-                if include_db_pension and age >= db_pension_age:
-                    adjusted_db_pension = db_pension_income * ((1 + inflation_rate) ** (age - db_pension_age))
-                    income += adjusted_db_pension
-                else:
-                    adjusted_db_pension = 0
-
-            # Check if we are in the desired income drawdown window
+            # Regular income draws within the desired window
             if income_start_age <= age <= income_end_age:
-                # Additional draw needed (beyond state and DB pensions)
-                remaining_needed = max(0, annual_retirement_income_adjusted - income)
+                remaining_needed = max(0, annual_retirement_income - income)
 
-                # First, try from uncrystallised fund as tax-free
-                if uncrystallised_fund > 0 and remaining_needed > 0:
-                    # We escalate the required amount with inflation from retirement_age, if desired
-                    tax_free_draw = remaining_needed * ((1 + inflation_rate) ** (age - retirement_age))
-                    withdrawal = min(uncrystallised_fund, tax_free_draw)
-                    uncrystallised_fund -= withdrawal
-                    # Crystallise 3x withdrawal
-                    crystallised_amt = withdrawal * 3
-                    crystallised_fund += crystallised_amt
-                    uncrystallised_fund -= min(uncrystallised_fund, crystallised_amt)
-                    income += withdrawal
-                    tax_free_cash = withdrawal
+                # First, take a tax-free slice from the uncrystallised fund
+                if remaining_needed > 0:
+                    tax_free = draw_tax_free(remaining_needed)
+                    income += tax_free
+                    tax_free_cash += tax_free
+                    remaining_needed -= tax_free
 
-                else:
-                    # If no uncrystallised, or we still have more to withdraw, pull from crystallised
-                    if crystallised_fund > 0:
-                        taxable_amount = remaining_needed * ((1 + inflation_rate) ** (age - retirement_age))
-                        withdrawal = min(crystallised_fund, taxable_amount)
-                        crystallised_fund -= withdrawal
-                        income += withdrawal
-                        tax_free_cash = 0
+                # Then top up from the crystallised pot (taxable). If the
+                # Lump Sum Allowance is exhausted, crystallise more of the
+                # remaining fund (with no tax-free element) to keep drawing.
+                if remaining_needed > 0:
+                    if (crystallised_fund < remaining_needed
+                            and lsa_remaining <= 0 and uncrystallised_fund > 0):
+                        transfer = min(remaining_needed - crystallised_fund,
+                                       uncrystallised_fund)
+                        uncrystallised_fund -= transfer
+                        crystallised_fund += transfer
+                    taxable_draw = min(remaining_needed, crystallised_fund)
+                    crystallised_fund -= taxable_draw
+                    income += taxable_draw
 
-            else:
-                # No additional regular income in this age
-                remaining_needed = 0
+        # ------------------------- Year-end accounting ------------------------
+        tax = calculate_taxes(income - tax_free_cash, tax_bands)
+        net_income = income - tax
 
-            # Calculate taxes
-            tax = calculate_taxes(income - tax_free_cash, tax_bands)
-            net_income = income - tax
-
-            # Only measure shortfall after retirement
+        # Only measure shortfall after retirement
+        if age >= retirement_age:
             shortfall = max(0, target_income - net_income)
 
         # Record the funds and incomes each year
@@ -547,9 +532,9 @@ def main():
     if strategy == "Accumulation":
         retirement_age = st.sidebar.number_input(
             "Target Retirement Age",
-            min_value=current_age+1,
+            min_value=current_age,
             max_value=100,
-            value=65
+            value=min(max(65, current_age), 100)
         )
         monthly_contribution = st.sidebar.number_input("Your Monthly Pension Contribution (£)", min_value=0, value=200)
         monthly_employer_contribution = st.sidebar.number_input("Employer Monthly Pension Contribution (£)", min_value=0, value=200)
@@ -590,7 +575,7 @@ def main():
         "Income End Age",
         min_value=int(income_start_age),
         max_value=100,
-        value=int(retirement_age + 20),
+        value=min(int(retirement_age) + 20, 100),
         help="Age at which you want your regular income to end."
     )
     # Ensure integer
@@ -605,6 +590,16 @@ def main():
     )
 
     include_state_pension = st.sidebar.checkbox("Include State Pension", value=True)
+    state_pension_age = assumptions['state_pension_age']
+    if include_state_pension:
+        state_pension_age = st.sidebar.number_input(
+            "State Pension Age",
+            min_value=66,
+            max_value=68,
+            value=assumptions['state_pension_age'],
+            help="State Pension age is rising from 66 to 67 between 2026 and 2028. "
+                 "Check yours at gov.uk/state-pension-age."
+        )
     include_db_pension = st.sidebar.checkbox("Include Defined Benefit (DB) Pension", value=False)
     db_pension_income = 0
     db_pension_age = retirement_age
@@ -645,6 +640,10 @@ def main():
     investment_growth_rate = st.sidebar.slider("Investment Growth Rate (%)", 0.0, 10.0, 5.0, 0.5) / 100
     salary_growth_rate = st.sidebar.slider("Salary Growth Rate (%)", 0.0, 10.0, 2.0, 0.5) / 100
     inflation_rate = st.sidebar.slider("Inflation Rate (%)", 0.0, 10.0, 2.0, 0.5) / 100
+    st.sidebar.caption(
+        "All results are shown in today's money (real terms): investment growth "
+        "is applied net of charges and inflation. Tax figures use 2026/27 rates."
+    )
 
     st.markdown("---")
 
@@ -682,6 +681,7 @@ def main():
             existing_tfc_withdrawals=existing_tfc_withdrawals,
             max_age=max_age,
             tax_bands=tax_bands,
+            state_pension_age=state_pension_age,
         )
 
         # Create results DataFrame
@@ -743,7 +743,10 @@ def main():
                 - **Investment Risk:** The value of investments can fall as well as rise, and you may get back less than you invested.
                 - **Inflation Risk:** Inflation can reduce the real value of your savings and investment returns.
                 - **Longevity Risk:** You may live longer than anticipated, leading to the risk of outliving your savings.
-                - **Taxation:** Tax rules can change and benefits depend on individual circumstances.
+                - **Taxation:** Tax rules can change and benefits depend on individual circumstances. This projection
+                  uses 2026/27 income tax bands and caps total tax-free cash at the Lump Sum Allowance (£268,275).
+                - **Projection Basis:** All figures are in today's money (real terms). This is an illustration,
+                  not financial advice or a guarantee of future benefits.
                 """
             )
 
